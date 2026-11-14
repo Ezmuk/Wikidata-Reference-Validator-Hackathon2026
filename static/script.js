@@ -1,65 +1,69 @@
-/**************************************
- * AUTOCOMPLETE SEARCH (UNCHANGED FLOW)
- **************************************/
-document.getElementById("search").addEventListener("input", async function () {
-  const query = this.value;
-  const suggestions = document.getElementById("suggestions");
+const searchInput = document.getElementById("search");
+const languageSelect = document.getElementById("language");
+const suggestions = document.getElementById("suggestions");
+let searchController;
+let searchRequestId = 0;
+
+async function loadSuggestions(query) {
+  if (searchController) searchController.abort();
+  const requestId = ++searchRequestId;
+  const language = languageSelect.value || "en";
   suggestions.innerHTML = "";
 
-  if (query.length < 3) return;
+  if (query.trim().length < 3) return;
 
-  const response = await fetch(
-    `https://www.wikidata.org/w/api.php?action=wbsearchentities&search=${encodeURIComponent(
-      query
-    )}&language=en&format=json&origin=*`
-  );
-  const data = await response.json();
-
-  data.search.forEach(item => {
-    const li = document.createElement("li");
-    li.className = "list-group-item list-group-item-action";
-
-    // label + description (Wikidata-style)
-    li.innerHTML = `
-      <div>
-        <strong>${item.label}</strong>
-        <div class="small text-muted">${item.description || ""}</div>
-      </div>
-    `;
-
-    li.onclick = () => {
-      const input = document.getElementById("search");
-      input.value = item.label;
-      input.setAttribute("data-qid", item.id);
-      input.setAttribute("data-label", item.label);
-      suggestions.innerHTML = "";
-    };
-
-    suggestions.appendChild(li);
-  });
-});
-
-/**************************************
- * PROPERTY LABEL CACHE (UNCHANGED)
- **************************************/
-const propertyLabelCache = {};
-
-async function getPropertyLabel(pid) {
-  if (!pid) return "";
-  if (propertyLabelCache[pid]) return propertyLabelCache[pid];
-
+  searchController = new AbortController();
   try {
-    const response = await fetch(
-      `https://www.wikidata.org/w/api.php?action=wbgetentities&ids=${pid}&format=json&languages=en&origin=*`
-    );
-    const data = await response.json();
-    const label = data.entities[pid]?.labels?.en?.value || "";
-    propertyLabelCache[pid] = label;
-    return label;
-  } catch {
-    return "";
+    const params = new URLSearchParams({ q: query, language });
+    const response = await fetch(`/search?${params}`, {
+      signal: searchController.signal
+    });
+    if (!response.ok) throw new Error("Search request failed");
+    const results = await response.json();
+
+    if (
+      requestId !== searchRequestId ||
+      language !== languageSelect.value ||
+      query !== searchInput.value
+    ) return;
+    if (!Array.isArray(results)) throw new Error("Invalid search response");
+
+    results.forEach(item => {
+      const li = document.createElement("li");
+      li.className = "list-group-item list-group-item-action";
+
+      const label = document.createElement("strong");
+      label.textContent = item.label || item.id || "";
+      const description = document.createElement("div");
+      description.className = "small text-muted";
+      description.textContent = item.description || "";
+      li.append(label, description);
+      li.addEventListener("click", () => {
+        searchInput.value = item.label || item.id || "";
+        searchInput.setAttribute("data-qid", item.id);
+        searchInput.setAttribute("data-label", item.label || item.id || "");
+        suggestions.innerHTML = "";
+      });
+      suggestions.appendChild(li);
+    });
+  } catch (error) {
+    if (error.name === "AbortError" || requestId !== searchRequestId) return;
+    const message = document.createElement("li");
+    message.className = "list-group-item text-danger";
+    message.textContent = "Search suggestions are temporarily unavailable.";
+    suggestions.appendChild(message);
   }
 }
+
+searchInput.addEventListener("input", function () {
+  this.removeAttribute("data-qid");
+  this.removeAttribute("data-label");
+  loadSuggestions(this.value);
+});
+
+languageSelect.addEventListener("change", () => {
+  loadSuggestions(searchInput.value);
+});
 
 /**************************************
  * VALIDATE REFERENCES (FIXED + SAFE)
@@ -108,7 +112,7 @@ async function validate() {
     const response = await fetch("/validate", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ qid })
+      body: JSON.stringify({ qid, language: languageSelect.value || "en" })
     });
 
     const data = await response.json();
@@ -278,7 +282,7 @@ async function validate() {
     resultDiv.innerHTML = `
       <div class="card p-4 text-center">
         <div class="alert alert-danger">
-          <i class="bi bi-bug"></i> Error: ${err}
+          <i class="bi bi-bug"></i> Reference validation could not be completed. Please try again.
         </div>
         <button class="btn btn-lg btn-glass-action mt-3"
                 onclick="resetSearch()">🔄 Search Another Item</button>
@@ -308,9 +312,12 @@ document.addEventListener("hidden.bs.collapse", e => {
  **************************************/
 function resetSearch() {
   const searchSection = document.getElementById("searchSection");
-  document.getElementById("search").value = "";
-  document.getElementById("search").removeAttribute("data-qid");
-  document.getElementById("search").removeAttribute("data-label");
+  searchInput.value = "";
+  searchInput.removeAttribute("data-qid");
+  searchInput.removeAttribute("data-label");
+  if (searchController) searchController.abort();
+  searchRequestId++;
+  suggestions.innerHTML = "";
   document.getElementById("result").innerHTML = "";
   searchSection.style.display = "block";
 }

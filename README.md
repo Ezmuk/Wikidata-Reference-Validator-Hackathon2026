@@ -7,6 +7,7 @@ This tool checks the external reference URLs on a Wikidata item (QID) to determi
 ## 🚀 What it does
 
 * 🔍 Autocompletes and selects Wikidata items
+* 🌐 Searches and displays labels in a selectable language, with English as the default and fallback
 * 🔗 Extracts all reference URLs from the item's statements
 * ⚡ Checks if the referenced URLs are reachable (alive or dead)
 * ❌ Flags dead links and shows which statement they belong to
@@ -87,6 +88,12 @@ python app.py
 
 Open your browser and go to:
 👉 http://127.0.0.1:5000
+
+### Run tests
+
+```bash
+python -m unittest discover -s tests -v
+```
 
 ---
 

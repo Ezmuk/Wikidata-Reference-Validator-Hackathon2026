@@ -1,3 +1,6 @@
+import json
+import re
+
 from flask import Flask, request, jsonify, render_template
 import requests
 import aiohttp
@@ -13,6 +16,22 @@ HEADERS = {
                   "AppleWebKit/537.36 (KHTML, like Gecko) "
                   "Chrome/115.0.0.0 Safari/537.36"
 }
+
+SUPPORTED_LANGUAGES = {
+    "en", "fr", "es", "de", "it", "pt", "sw", "ar", "zh", "ja", "nl"
+}
+
+
+def normalize_language(language):
+    if not isinstance(language, str):
+        return "en"
+
+    language = language.strip().lower()
+    return language if language in SUPPORTED_LANGUAGES else "en"
+
+
+def language_fallbacks(language):
+    return [language] if language == "en" else [language, "en"]
 
 
 # ---------------------------------------------------
@@ -39,26 +58,45 @@ def report():
 
 @app.route("/search")
 def search():
-    query = request.args.get("q")
+    query = request.args.get("q", "").strip()
     if not query:
         return jsonify([])
 
+    language = normalize_language(request.args.get("language"))
     params = {
         "action": "wbsearchentities",
         "search": query,
-        "language": "en",
+        "language": language,
+        "uselang": language,
         "format": "json"
     }
 
-    r = requests.get(WIKIDATA_API, params=params)
-    data = r.json()
+    try:
+        response = requests.get(WIKIDATA_API, params=params, headers=HEADERS, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        if not isinstance(data, dict) or not isinstance(data.get("search"), list):
+            raise ValueError("Invalid search response")
+    except (requests.RequestException, ValueError):
+        app.logger.exception("Wikidata search request failed")
+        return jsonify({"error": "Wikidata search is temporarily unavailable."}), 502
+
+    search_items = data["search"]
+    missing_labels = {
+        item["id"] for item in search_items
+        if isinstance(item, dict) and item.get("id") and not item.get("label")
+    }
+    fallback_labels = fetch_labels(missing_labels, language)
 
     results = []
-    for item in data.get("search", []):
+    for item in search_items:
+        if not isinstance(item, dict):
+            continue
+        item_id = item.get("id")
         results.append({
-            "id": item.get("id"),
-            "label": item.get("label"),
-            "description": item.get("description", "")
+            "id": item_id,
+            "label": item.get("label") or fallback_labels.get(item_id) or item_id,
+            "description": item.get("description", ""),
         })
 
     return jsonify(results)
@@ -119,12 +157,14 @@ def fetch_wayback_snapshot(url):
 # LABEL FETCHING
 # ---------------------------------------------------
 
-def fetch_labels(ids):
+def fetch_labels(ids, language="en"):
     labels = {}
     if not ids:
         return labels
 
-    id_list = list(ids)
+    language = normalize_language(language)
+    languages = "|".join(language_fallbacks(language))
+    id_list = sorted(set(ids))
     chunks = [id_list[i:i + 50] for i in range(0, len(id_list), 50)]
 
     for chunk in chunks:
@@ -133,23 +173,83 @@ def fetch_labels(ids):
             "ids": "|".join(chunk),
             "format": "json",
             "props": "labels",
-            "languages": "en"
+            "languages": languages
         }
 
         try:
             r = requests.get(WIKIDATA_API, params=params, headers=HEADERS, timeout=10)
             r.raise_for_status()
-            entities = r.json().get("entities", {})
+            data = r.json()
+            if not isinstance(data, dict) or not isinstance(data.get("entities"), dict):
+                raise ValueError("Invalid label response")
+            entities = data["entities"]
 
-            for eid, data in entities.items():
-                label = data.get("labels", {}).get("en", {}).get("value")
-                if label:
-                    labels[eid] = label
+            for eid, entity_data in entities.items():
+                entity_labels = (
+                    entity_data.get("labels", {})
+                    if isinstance(entity_data, dict) else {}
+                )
+                label = next(
+                    (
+                        entity_labels.get(lang, {}).get("value")
+                        for lang in language_fallbacks(language)
+                        if entity_labels.get(lang, {}).get("value")
+                    ),
+                    eid
+                )
+                labels[eid] = label
 
-        except Exception as e:
-            print(f"[Label fetch failed] {chunk}: {e}")
+        except (requests.RequestException, ValueError) as error:
+            app.logger.warning("Wikidata label lookup failed for %s: %s", chunk, error)
+            labels.update({entity_id: entity_id for entity_id in chunk})
 
     return labels
+
+
+def statement_entity_ids(datavalue):
+    if not isinstance(datavalue, dict):
+        return set()
+
+    entity_id = datavalue.get("id")
+    ids = {entity_id} if isinstance(entity_id, str) else set()
+
+    quantity = datavalue.get("amount")
+    unit = datavalue.get("unit")
+    if quantity is not None and isinstance(unit, str):
+        match = re.search(r"/entity/(Q\d+)$", unit)
+        if match:
+            ids.add(match.group(1))
+
+    return ids
+
+
+def format_statement_value(datavalue, labels):
+    if isinstance(datavalue, dict):
+        if "id" in datavalue:
+            entity_id = datavalue["id"]
+            return labels.get(entity_id, entity_id)
+        if "text" in datavalue and "language" in datavalue:
+            return str(datavalue["text"])
+        if "amount" in datavalue:
+            amount = str(datavalue["amount"])
+            unit = datavalue.get("unit", "1")
+            unit_match = re.search(r"/entity/(Q\d+)$", unit) if isinstance(unit, str) else None
+            if unit_match:
+                return f"{amount} {labels.get(unit_match.group(1), unit_match.group(1))}"
+            return amount if unit == "1" else f"{amount} {unit}"
+        if "time" in datavalue:
+            return str(datavalue["time"]).lstrip("+")
+        if "latitude" in datavalue and "longitude" in datavalue:
+            return f'{datavalue["latitude"]}, {datavalue["longitude"]}'
+        if "uri" in datavalue:
+            return str(datavalue["uri"])
+        return json.dumps(datavalue, ensure_ascii=False, sort_keys=True)
+
+    if datavalue is None:
+        return ""
+    if isinstance(datavalue, (str, int, float, bool)):
+        return str(datavalue)
+    return json.dumps(datavalue, ensure_ascii=False, sort_keys=True)
 
 
 # ---------------------------------------------------
@@ -158,23 +258,27 @@ def fetch_labels(ids):
 
 @app.route("/validate", methods=["POST"])
 def validate_references():
-    data = request.get_json(force=True)
-    if not data or "qid" not in data:
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict) or not isinstance(data.get("qid"), str):
         return jsonify({"error": "Missing QID"}), 400
 
     qid = data["qid"].strip()
+    if not qid:
+        return jsonify({"error": "Missing QID"}), 400
+    language = normalize_language(data.get("language"))
 
     try:
         params = {
             "action": "wbgetentities",
             "ids": qid,
-            "format": "json"
+            "format": "json",
+            "props": "claims"
         }
 
         r = requests.get(WIKIDATA_API, params=params, headers=HEADERS, timeout=15)
         r.raise_for_status()
 
-        entity = r.json()["entities"].get(qid, {})
+        entity = r.json().get("entities", {}).get(qid, {})
         claims = entity.get("claims", {})
 
         refs_data = []
@@ -182,12 +286,8 @@ def validate_references():
 
         for prop, statements in claims.items():
             for stmt in statements:
-                statement_value = None
                 mainsnak = stmt.get("mainsnak", {})
                 datavalue = mainsnak.get("datavalue", {}).get("value")
-
-                if isinstance(datavalue, dict) and "id" in datavalue:
-                    statement_value = datavalue["id"]
 
                 for ref in stmt.get("references", []):
                     for snaks in ref.get("snaks", {}).values():
@@ -204,11 +304,10 @@ def validate_references():
                                 refs_data.append({
                                     "url": ref_url,
                                     "property": prop,
-                                    "statementValue": statement_value
+                                    "datavalue": datavalue
                                 })
                                 all_ids_to_label.add(prop)
-                                if statement_value and statement_value.startswith("Q"):
-                                    all_ids_to_label.add(statement_value)
+                                all_ids_to_label.update(statement_entity_ids(datavalue))
 
         if not refs_data:
             return jsonify({"message": "No references found"}), 200
@@ -219,7 +318,7 @@ def validate_references():
                 return await asyncio.gather(*tasks)
 
         url_statuses = asyncio.run(run_checks())
-        labels = fetch_labels(all_ids_to_label)
+        labels = fetch_labels(all_ids_to_label, language)
 
         results = []
         for ref_data, status_data in zip(refs_data, url_statuses):
@@ -227,10 +326,7 @@ def validate_references():
                 "url": ref_data["url"],
                 "status": status_data["status"],
                 "propertyLabel": labels.get(ref_data["property"], ref_data["property"]),
-                "statementValue": labels.get(
-                    ref_data["statementValue"],
-                    ref_data["statementValue"]
-                ) if ref_data["statementValue"] else ""
+                "statementValue": format_statement_value(ref_data["datavalue"], labels)
             }
 
             # 🔁 Wayback suggestion ONLY for dead refs
@@ -243,8 +339,12 @@ def validate_references():
 
         return jsonify(results)
 
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    except (requests.RequestException, ValueError, KeyError) as error:
+        app.logger.exception("Wikidata validation request failed: %s", error)
+        return jsonify({"error": "Unable to retrieve Wikidata item data right now."}), 502
+    except Exception:
+        app.logger.exception("Reference validation failed")
+        return jsonify({"error": "Reference validation could not be completed."}), 500
 
 
 # ---------------------------------------------------
